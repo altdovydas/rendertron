@@ -1,6 +1,7 @@
 import puppeteer, { ScreenshotOptions } from 'puppeteer';
 import url from 'url';
 import { dirname } from 'path';
+import cache from 'memory-cache';
 
 import { Config } from './config';
 
@@ -128,11 +129,67 @@ export class Renderer {
     await page.setRequestInterception(true);
 
     page.on('request', (interceptedRequest: puppeteer.HTTPRequest) => {
-      if (this.restrictRequest(interceptedRequest.url())) {
-        interceptedRequest.abort();
-      } else {
-        interceptedRequest.continue();
+      if (['image', 'font', 'media'].includes(interceptedRequest.resourceType())) {
+        return interceptedRequest.abort();
       }
+
+      if (this.restrictRequest(interceptedRequest.url())) {
+        return interceptedRequest.abort();
+      }
+
+      const body = cache.get(encodeURIComponent(interceptedRequest.url()));
+
+      if (body) {
+        return interceptedRequest.respond({ status: 200, body: body });
+      }
+
+      return interceptedRequest.continue();
+    });
+
+    page.on('requestfinished', (interceptedRequest: puppeteer.HTTPRequest) => {
+      const response = interceptedRequest.response();
+
+      if (!response || interceptedRequest.method() !== 'GET') {
+        return;
+      }
+
+      const cacheControl = response.headers()['cache-control'] ?? null;
+
+      if (!cacheControl) {
+        return;
+      }
+
+      const matches = cacheControl.match(/max-age=(\d+)/)
+      const maxAge = matches ? parseInt(matches[1], 10) : -1
+      const requestCachePolicy = interceptedRequest.headers()['cache-control'] ?? null;
+
+      if (
+          maxAge <= 0 ||
+          (requestCachePolicy && (requestCachePolicy.indexOf('no-cache') >= 0 || requestCachePolicy.indexOf('private') >= 0)) ||
+          [301, 302].includes(response.status()) ||
+          ['image', 'document'].includes(interceptedRequest.resourceType())
+      ) {
+        return;
+      }
+
+      const body = cache.get(encodeURIComponent(interceptedRequest.url()));
+
+      if (body) {
+        return;
+      }
+
+      response
+          .buffer()
+          .then(buffer => {
+            cache.put(
+                encodeURIComponent(interceptedRequest.url()),
+                buffer.toString(),
+                maxAge * 1000
+            );
+          })
+          .catch(err => {
+            console.log(`Cache Save Failed: ${err}`);
+          });
     });
 
     let response: puppeteer.HTTPResponse | null = null;
